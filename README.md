@@ -42,9 +42,38 @@ cd hk-sfc-licensees
 pip install -r requirements.txt
 ```
 
+## Bundled snapshot
+
+For convenience, this repository ships a one-time snapshot of the database
+as a gzipped SQL dump:
+
+| File          | Size                                                          |
+| ------------- | ------------------------------------------------------------- |
+| `db.sql.gz`   | ~12 MB compressed (~82 MB SQL text, ~5.7k firms, ~134k people) |
+
+It is **not** kept in sync with the SFC register — treat it as a starting
+point and run `python update_sfc.py` afterwards to bring it up to date.
+
+### Restore the snapshot
+
+Unix/macOS:
+
+```bash
+gunzip -c db.sql.gz | sqlite3 sfc.db
+```
+
+Windows PowerShell (no need for the `sqlite3` CLI):
+
+```powershell
+python -c "import sqlite3, gzip; con=sqlite3.connect('sfc.db'); con.executescript(gzip.open('db.sql.gz','rt',encoding='utf-8').read()); con.close()"
+```
+
+After restoring you have a populated `sfc.db` and can immediately run
+`python update_sfc.py` to refresh it.
+
 ## Usage
 
-### First run (full build)
+### First run from scratch (full build)
 
 ```bash
 python update_sfc.py --full
@@ -53,7 +82,8 @@ python update_sfc.py --full
 This creates `sfc.db` in the current directory and pulls the entire SFC
 public register. It walks every regulated activity type (1–13) and every
 starting letter for both corporations and individuals. The full build is
-network-intensive — expect a large number of HTTP requests.
+network-intensive — expect a large number of HTTP requests. If you would
+rather start from the bundled snapshot, see the section above.
 
 ### Incremental updates
 
