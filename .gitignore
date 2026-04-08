@@ -1,0 +1,21 @@
+# SQLite database files
+*.db
+*.db-wal
+*.db-shm
+*.db.backup
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
