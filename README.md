@@ -8,26 +8,82 @@ scraping the SFC public register at <https://apps.sfc.hk/publicregWeb>.
 No authentication is required. The script talks only to the public register
 endpoints that power the SFC's own website.
 
+> **Just want to browse the data?** A hosted version of this database, with a
+> web UI for searching firms, individuals, career histories, and industry
+> statistics, is available at **<https://thesfcnetwork.com/#dashboard>** —
+> use that if you don't want to run anything yourself.
+
 ## What you get
 
-After a full run, you have a single SQLite file (`sfc.db` by default)
-containing:
+After a full run, you have a single SQLite file (`sfc.db` by default). The
+full schema lives in [`schema.sql`](schema.sql) and is created automatically
+on first run.
+
+### Tables
 
 | Table           | Contents                                                          |
 | --------------- | ----------------------------------------------------------------- |
 | `organisations` | Licensed firms (active and dissolved), with SFC CE reference      |
 | `people`        | Individual licensees (active and ceased)                          |
 | `licrec`        | Per-person × firm × activity × role × period licence records      |
-| `olicrec`       | Per-firm licence records                                          |
+| `olicrec`       | Per-firm licence records by activity and period                   |
 | `directorships` | Computed RO/Rep appointments (RO trumps Rep on overlapping dates) |
 | `licrecsum`     | Monthly summary totals by activity type                           |
-| `orgdata`       | Firm addresses                                                    |
+| `orgdata`       | Firm registered addresses                                         |
 | `web`           | Firm website URLs                                                 |
 | `old_sfc_ids`   | Historical SFC IDs from amalgamations                             |
 | `activity`      | The 13 SFC regulated activity types                               |
 
-The schema lives in [`schema.sql`](schema.sql) and is created automatically on
-first run.
+### Schema in brief
+
+**Two entity tables.** `organisations` and `people` are the two anchor
+tables. Each has its own internal primary key `person_id` (these are
+*separate* ID spaces despite the shared column name) and an `sfc_id` column
+holding the SFC's public CE reference (e.g. `AAA001` for firms, `BRQ870` for
+individuals).
+
+**Two licence-record tables.** Both use a "one row per period" model:
+
+- `licrec` rows answer *"who held what licence at which firm, in which role,
+  over which period?"* — joined to `people` via `staff_id` and to
+  `organisations` via `org_id`.
+- `olicrec` rows answer the same question at the firm level
+  (firm × activity × period), with no person attached.
+
+**Time conventions.** All dates are ISO `YYYY-MM-DD` text. `start_date IS
+NULL` means the licence *predates the SFC online register* (before
+2003-04-01); `end_date IS NULL` means it is *currently active*.
+
+**Encoding cheat sheet.**
+
+| Column                       | Meaning                                                  |
+| ---------------------------- | -------------------------------------------------------- |
+| `licrec.role`                | `1` = RO (Responsible Officer), `0` = Rep (Representative) |
+| `directorships.position_id`  | `395` = RO, `394` = Rep                                  |
+| `act_type` (1–13)            | SFC regulated activity — see the `activity` table        |
+| `organisations.sfc_ri`       | `1` = Registered Institution (bank), `0` = Licensed Corp |
+| `organisations.org_type`     | `19` = Limited, `10` = LLC, `9` = LLP                    |
+| `organisations.dis_date`     | NULL = still in business; date = dissolved/ceased        |
+
+**Amalgamations.** When a firm rebrands or merges and is reissued a new SFC
+CE reference, the old reference is preserved in `old_sfc_ids` pointing at
+the same `org_id` as before. Lookups by `sfc_id` should always check this
+table too.
+
+### Example query: top 10 firms by current Responsible Officer count
+
+```sql
+SELECT o.name1                     AS firm,
+       COUNT(DISTINCT l.staff_id)  AS ro_count
+FROM   licrec       l
+JOIN   organisations o ON o.person_id = l.org_id
+WHERE  l.role = 1                -- RO
+  AND  l.end_date IS NULL        -- still active
+  AND  o.dis_date IS NULL        -- firm still in business
+GROUP  BY o.person_id
+ORDER  BY ro_count DESC
+LIMIT  10;
+```
 
 ## Requirements
 
