@@ -1,8 +1,5 @@
 -- SFC Licensee Database Schema (SQLite)
---
--- Mirrors data from the Hong Kong Securities and Futures Commission (SFC)
--- public register at https://apps.sfc.hk/publicregWeb. Created automatically
--- by update_sfc.py on first run.
+-- Based on David Webb's Webb-site database structure
 
 -- Activity types (regulated activities under SFO)
 CREATE TABLE IF NOT EXISTS activity (
@@ -11,6 +8,7 @@ CREATE TABLE IF NOT EXISTS activity (
 );
 
 INSERT OR IGNORE INTO activity (id, name) VALUES
+    (0, 'All regulated activities'),
     (1, 'Dealing in securities'),
     (2, 'Dealing in futures contracts'),
     (3, 'Leveraged foreign exchange trading'),
@@ -69,6 +67,9 @@ CREATE TABLE IF NOT EXISTS licrec (
 CREATE INDEX IF NOT EXISTS idx_licrec_staff ON licrec(staff_id);
 CREATE INDEX IF NOT EXISTS idx_licrec_org ON licrec(org_id);
 CREATE INDEX IF NOT EXISTS idx_licrec_dates ON licrec(start_date, end_date);
+CREATE INDEX IF NOT EXISTS idx_licrec_end_date ON licrec(end_date);
+CREATE INDEX IF NOT EXISTS idx_licrec_lookup ON licrec(staff_id, org_id, role, act_type, start_date);
+CREATE INDEX IF NOT EXISTS idx_licrec_sum_activity_dates ON licrec(act_type, start_date, end_date, staff_id, role);
 
 -- Organisation licence records
 CREATE TABLE IF NOT EXISTS olicrec (
@@ -81,6 +82,7 @@ CREATE TABLE IF NOT EXISTS olicrec (
 );
 
 CREATE INDEX IF NOT EXISTS idx_olicrec_org ON olicrec(org_id);
+CREATE INDEX IF NOT EXISTS idx_olicrec_lookup ON olicrec(org_id, act_type, start_date);
 
 -- Computed role appointments (RO trumps Rep for overlapping periods)
 CREATE TABLE IF NOT EXISTS directorships (
@@ -94,6 +96,7 @@ CREATE TABLE IF NOT EXISTS directorships (
 
 CREATE INDEX IF NOT EXISTS idx_dir_company ON directorships(company);
 CREATE INDEX IF NOT EXISTS idx_dir_director ON directorships(director);
+CREATE INDEX IF NOT EXISTS idx_dir_director_position_date ON directorships(director, position_id, appt_date);
 
 -- Monthly summary totals by activity type
 CREATE TABLE IF NOT EXISTS licrecsum (

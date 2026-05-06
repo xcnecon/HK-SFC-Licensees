@@ -136,9 +136,9 @@ python update_sfc.py --full
 ```
 
 This creates `sfc.db` in the current directory and pulls the entire SFC
-public register. It walks every regulated activity type (1–13) and every
+public register. It walks every regulated activity type (1-13) and every
 starting letter for both corporations and individuals. The full build is
-network-intensive — expect a large number of HTTP requests. If you would
+network-intensive; expect a large number of HTTP requests. If you would
 rather start from the bundled snapshot, see the section above.
 
 ### Incremental updates
@@ -164,10 +164,14 @@ SFC_DB_PATH=/path/to/my-sfc.db python update_sfc.py
 | Flag        | What it does                                                            |
 | ----------- | ----------------------------------------------------------------------- |
 | `--full`    | Force re-fetch of every entity, ignoring the 12-hour skip window.       |
+| `--db PATH` | Use a specific SQLite database path instead of `./sfc.db`.              |
 | `--missing` | Only fetch histories for people in the DB whose `sfc_upd` is NULL.      |
 | `--step5`   | Only run Step 5 — discover all individuals (incl. ceased).              |
 | `--step6`   | Only run Step 6 — refresh org addresses and websites.                   |
 | `--step7`   | Only run Step 7 — recompute the monthly licence totals.                 |
+| `--max-age-hours HOURS` | Override the incremental skip window.                       |
+| `--workers N` | Override the number of parallel HTTP worker threads.                 |
+| `--log-file PATH` | Append timestamped logs to a file.                              |
 
 ## How it works
 
@@ -186,27 +190,30 @@ The full build runs seven sequential steps:
 6. **Update addresses** — pull each firm's registered address and website.
 7. **Compute monthly totals** — derive `licrecsum` from `licrec`.
 
-All HTTP fetching uses a thread pool (`WORKER_THREADS = 8` by default), with
+All HTTP fetching uses a thread pool (8 workers by default), with
 exponential-backoff retries on transient failures. SQLite writes are
 serialised through a single connection and a write lock; WAL mode is enabled.
 
 ## Going through a proxy
 
-The script uses `requests`, which automatically honours the standard proxy
-environment variables. If you need to route traffic through a proxy:
+The script supports explicit SFC proxy settings. If you need to route traffic
+through a proxy:
 
 ```bash
-export HTTPS_PROXY=http://user:pass@proxy.example.com:8080
-export HTTP_PROXY=http://user:pass@proxy.example.com:8080
+export SFC_PROXY_URL=http://user:pass@proxy.example.com:8080
 python update_sfc.py --full
 ```
+
+Alternatively set `SFC_PROXY_HOST` and optional `SFC_PROXY_AUTH`. If no SFC
+proxy variables are set, `requests` can still use standard environment proxy
+settings such as `HTTPS_PROXY`.
 
 ## Being polite to the SFC server
 
 By default the script makes requests as fast as the network allows, with no
 artificial delay between calls. If you want to be gentler on the upstream API,
-edit `REQUEST_DELAY` near the top of `update_sfc.py` to a value greater than
-zero (in seconds), or reduce `WORKER_THREADS`.
+set `SFC_REQUEST_DELAY` to a value greater than zero (in seconds), or reduce
+workers with `--workers` / `SFC_WORKER_THREADS`.
 
 ## Data accuracy and limitations
 

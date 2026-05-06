@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
 SFC Licensee Database Updater
-
-Builds and maintains a local SQLite database of all Hong Kong Securities and
-Futures Commission (SFC) licensed corporations and individuals — both active
-and historical — by scraping the SFC public register at
-https://apps.sfc.hk/publicregWeb (no authentication required).
+Port of David Webb's VB.NET SFC.vb scraper to Python.
+Scrapes the SFC public register API to maintain a local SQLite database
+of licensed corporations and individuals.
 
 Usage:
-    python update_sfc.py [--full] [--db PATH]
+    python update_sfc.py [--full] [--db PATH] [--max-age-hours HOURS] [--workers N]
 
-    --full      Force complete re-fetch, ignoring sfc_upd timestamps.
-    --db PATH   Path to the SQLite database file (default: ./sfc.db).
-
-The database is created from schema.sql (must sit next to this script) on
-first run. Subsequent runs skip entities updated within the last 12 hours.
-
-To route requests through an HTTP/HTTPS proxy, set the standard environment
-variables HTTPS_PROXY / HTTP_PROXY before running. The `requests` library
-honours these automatically.
+    --full              Force complete re-fetch ignoring sfc_upd timestamps
+    --db PATH           Path to the SQLite database file (default: ./sfc.db)
+    --max-age-hours     Skip entities updated within this many hours
+    --workers           Parallel HTTP worker threads
+    --log-file          Also append logs to a file
 """
 
 import argparse
@@ -30,6 +24,7 @@ import sqlite3
 import sys
 import threading
 import time
+import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -42,20 +37,32 @@ from requests.adapters import HTTPAdapter
 # ---------------------------------------------------------------------------
 BASE_URL = "https://apps.sfc.hk/publicregWeb"
 SEARCH_URL = f"{BASE_URL}/searchByRaJson"
-REQUEST_DELAY = 0            # seconds between requests (0 = no throttle)
-MAX_RETRIES = 3
-RETRY_BACKOFF = 2.0          # exponential backoff multiplier
-WORKER_THREADS = 8           # parallel HTTP fetching threads
-HOURS_THRESHOLD = 12         # skip re-fetch if updated within this many hours
+REQUEST_DELAY = float(os.environ.get("SFC_REQUEST_DELAY", "0"))
+MAX_RETRIES = max(1, int(os.environ.get("SFC_MAX_RETRIES", "3")))
+RETRY_BACKOFF = float(os.environ.get("SFC_RETRY_BACKOFF", "2.0"))
+WORKER_THREADS = max(1, int(os.environ.get("SFC_WORKER_THREADS", "8")))
+REQUEST_TIMEOUT = (
+    float(os.environ.get("SFC_CONNECT_TIMEOUT", "10")),
+    float(os.environ.get("SFC_READ_TIMEOUT", "60")),
+)
+HOURS_THRESHOLD = float(os.environ.get("SFC_HOURS_THRESHOLD", "12"))
+LOG_PATH = os.environ.get("SFC_LOG_PATH")
+LOG_TRACEBACKS = os.environ.get("SFC_LOG_TRACEBACKS", "").lower() in ("1", "true", "yes")
+
+PROXY_URL = os.environ.get("SFC_PROXY_URL")
+if not PROXY_URL:
+    PROXY_HOST = os.environ.get("SFC_PROXY_HOST")
+    PROXY_AUTH = os.environ.get("SFC_PROXY_AUTH")
+    if PROXY_HOST:
+        proxy_netloc = f"{PROXY_AUTH}@{PROXY_HOST}" if PROXY_AUTH else PROXY_HOST
+        PROXY_URL = f"http://{proxy_netloc}"
+PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 ACTIVITY_TYPES = list(range(1, 14))
 LETTERS_CORP = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 LETTERS_INDI = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCHEMA_PATH = os.path.join(_SCRIPT_DIR, "schema.sql")
-# DB_PATH defaults to ./sfc.db in the current working directory.
-# Override via the --db CLI flag or the SFC_DB_PATH environment variable.
-DB_PATH = os.environ.get("SFC_DB_PATH") or os.path.join(os.getcwd(), "sfc.db")
+DB_PATH = os.path.abspath(os.environ.get("SFC_DB_PATH") or os.path.join(os.getcwd(), "sfc.db"))
 
 # Pre-SFC-system date: licences with this start date are treated as NULL
 PRE_SYSTEM_DATE = "2003-04-01"
@@ -63,70 +70,113 @@ PRE_SYSTEM_DATE = "2003-04-01"
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-def log(msg):
-    """Print progress message to stderr."""
-    print(msg, file=sys.stderr, flush=True)
+_log_lock = threading.Lock()
+_log_file = None
+
+def configure_logging(log_path=None):
+    """Configure optional file logging."""
+    global _log_file
+    if _log_file:
+        close_logging()
+    if not log_path:
+        return
+    path = os.path.abspath(log_path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _log_file = open(path, "a", encoding="utf-8")
+    log(f"Logging to {path}")
+
+def close_logging():
+    """Close the optional log file handle."""
+    global _log_file
+    if _log_file:
+        _log_file.close()
+        _log_file = None
+
+def log(msg, level="INFO"):
+    """Print a timestamped progress message to stderr and optional file."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = str(msg).splitlines() or [""]
+    with _log_lock:
+        for line in lines:
+            formatted = f"{timestamp} [{level}] {line}"
+            print(formatted, file=sys.stderr, flush=True)
+            if _log_file:
+                _log_file.write(formatted + "\n")
+        if _log_file:
+            _log_file.flush()
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
-_session = requests.Session()
-_session.headers.update({
-    "User-Agent": "sfc-updater/1.0 (+https://github.com/)",
-    "Accept": "text/html,application/json,*/*",
-})
-# requests honours HTTPS_PROXY / HTTP_PROXY env vars automatically; no
-# explicit proxy configuration is needed here.
-_pool_adapter = HTTPAdapter(pool_connections=WORKER_THREADS, pool_maxsize=WORKER_THREADS)
-_session.mount("https://", _pool_adapter)
-_session.mount("http://", _pool_adapter)
-
+_thread_local = threading.local()
 _last_request_time = 0.0
+_request_lock = threading.Lock()
+
+def get_http_session():
+    """Return a requests Session scoped to the current worker thread."""
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SFC-Updater/1.0",
+            "Accept": "text/html,application/json,*/*",
+        })
+        if PROXIES:
+            session.proxies.update(PROXIES)
+        adapter = HTTPAdapter(pool_connections=1, pool_maxsize=1)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _thread_local.session = session
+    return session
 
 def _throttle():
     """Ensure at least REQUEST_DELAY seconds between HTTP requests."""
+    if REQUEST_DELAY <= 0:
+        return
     global _last_request_time
-    elapsed = time.time() - _last_request_time
-    if elapsed < REQUEST_DELAY:
-        time.sleep(REQUEST_DELAY - elapsed)
-    _last_request_time = time.time()
+    with _request_lock:
+        elapsed = time.time() - _last_request_time
+        if elapsed < REQUEST_DELAY:
+            time.sleep(REQUEST_DELAY - elapsed)
+        _last_request_time = time.time()
 
-def fetch_get(url):
-    """GET with retry and exponential backoff. Returns response text or ''."""
+def _request(method, url, **kwargs):
+    """HTTP request with retry and exponential backoff."""
+    last_error = None
     for attempt in range(MAX_RETRIES):
         try:
             _throttle()
-            resp = _session.get(url, timeout=30)
-            resp.raise_for_status()
-            return resp.text
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                wait = RETRY_BACKOFF ** (attempt + 1)
-                log(f"  Retry {attempt+1}/{MAX_RETRIES} for GET {url}: {e} (wait {wait:.1f}s)")
-                time.sleep(wait)
-            else:
-                log(f"  FAILED GET after {MAX_RETRIES} attempts: {url} -> {e}")
-                return ""
-
-def fetch_post(url, data):
-    """POST with retry and exponential backoff. Returns response text or ''."""
-    for attempt in range(MAX_RETRIES):
-        try:
-            _throttle()
-            resp = _session.post(
-                url, data=data, timeout=30,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            resp = get_http_session().request(
+                method, url, timeout=REQUEST_TIMEOUT, **kwargs
             )
             resp.raise_for_status()
             return resp.text
-        except Exception as e:
+        except requests.RequestException as e:
+            last_error = e
             if attempt < MAX_RETRIES - 1:
                 wait = RETRY_BACKOFF ** (attempt + 1)
-                log(f"  Retry {attempt+1}/{MAX_RETRIES} for POST: {e} (wait {wait:.1f}s)")
+                log(
+                    f"  Retry {attempt+1}/{MAX_RETRIES} for {method} {url}: "
+                    f"{e} (wait {wait:.1f}s)",
+                    level="WARNING",
+                )
                 time.sleep(wait)
-            else:
-                log(f"  FAILED POST after {MAX_RETRIES} attempts: {url} -> {e}")
-                return ""
+    raise RuntimeError(
+        f"FAILED {method} after {MAX_RETRIES} attempts: {url} -> {last_error}"
+    )
+
+def fetch_get(url):
+    """GET with retry and exponential backoff. Returns response text."""
+    return _request("GET", url)
+
+def fetch_post(url, data):
+    """POST with retry and exponential backoff. Returns response text."""
+    return _request(
+        "POST",
+        url,
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
 
 def get_sfc_page(page, sfc_id, ptype):
     """Fetch an SFC entity page. ptype: 'corp', 'ri', or 'indi'."""
@@ -188,7 +238,7 @@ def extract_json_var(html, var_name):
                         try:
                             return json.loads(raw2)
                         except json.JSONDecodeError:
-                            log(f"  WARNING: Could not parse JSON for var {var_name}")
+                            log(f"  Could not parse JSON for var {var_name}", level="WARNING")
                             return None
         i += 1
     return None
@@ -201,7 +251,7 @@ def extract_search_items(response_text):
         data = json.loads(response_text)
         return data.get("items", [])
     except json.JSONDecodeError:
-        log("  WARNING: Could not parse search response JSON")
+        log("  Could not parse search response JSON", level="WARNING")
         return []
 
 # ---------------------------------------------------------------------------
@@ -271,6 +321,7 @@ def name_split(full_name):
     SFC names have uppercase surname followed by forenames.
     "CHAN Wing Hing Barry" -> ("Chan", "Wing Hing Barry")
     "LI Ngok" -> ("Li", "Ngok")
+    Ported from SFC.vb NameSplit (lines 523-581).
     """
     n = strip_space(full_name)
     if not n:
@@ -392,25 +443,47 @@ def hours_since(timestamp_str):
 # ---------------------------------------------------------------------------
 _db = None
 _db_lock = threading.Lock()
+_RUNTIME_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_licrec_lookup "
+    "ON licrec(staff_id, org_id, role, act_type, start_date)",
+    "CREATE INDEX IF NOT EXISTS idx_licrec_sum_activity_dates "
+    "ON licrec(act_type, start_date, end_date, staff_id, role)",
+    "CREATE INDEX IF NOT EXISTS idx_licrec_end_date "
+    "ON licrec(end_date)",
+    "CREATE INDEX IF NOT EXISTS idx_olicrec_lookup "
+    "ON olicrec(org_id, act_type, start_date)",
+    "CREATE INDEX IF NOT EXISTS idx_dir_director_position_date "
+    "ON directorships(director, position_id, appt_date)",
+)
 
 def get_db():
     """Get or create the database connection.
 
-    Must be called from the main thread before spawning workers.
+    The connection is protected by _db_lock and runs each statement in
+    autocommit mode so worker threads cannot share half-open transactions.
     """
     global _db
     if _db is None:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         need_schema = not os.path.exists(DB_PATH)
-        _db = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _db.execute("PRAGMA journal_mode=WAL")
-        _db.execute("PRAGMA foreign_keys=ON")
+        _db = sqlite3.connect(
+            DB_PATH,
+            timeout=60,
+            check_same_thread=False,
+            isolation_level=None,
+        )
         _db.row_factory = sqlite3.Row
+        _db.execute("PRAGMA journal_mode=WAL")
+        _db.execute("PRAGMA synchronous=NORMAL")
+        _db.execute("PRAGMA foreign_keys=ON")
+        _db.execute("PRAGMA busy_timeout=60000")
         if need_schema:
             log(f"Creating new database at {DB_PATH}")
             with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
                 _db.executescript(f.read())
             _db.commit()
+        for index_sql in _RUNTIME_INDEXES:
+            _db.execute(index_sql)
     return _db
 
 def db_execute(sql, params=None):
@@ -495,6 +568,7 @@ def sfc_id_to_org_id(sfc_id, name, c_name, ptype):
     """Resolve an SFC CE reference to an internal org ID.
 
     Creates a new org if necessary. Handles amalgamations via old_sfc_ids.
+    Ported from SFC.vb SFCIDorgID (lines 1073-1135).
     Thread-safe: retries once on IntegrityError from concurrent inserts.
     """
     try:
@@ -686,9 +760,12 @@ def read_ind_lic_records(sfc_id):
     data = extract_json_var(html, "licRecordData")
     if data is None:
         return [], False
-    if isinstance(data, list) and len(data) == 0:
-        # SFC returned empty array — don't delete our records
+    if not isinstance(data, list):
         return [], False
+    if isinstance(data, list) and len(data) == 0:
+        # SFC returned an accessible but empty history. Treat it as a
+        # successful fetch, but let the caller preserve existing records.
+        return [], True
 
     records = []
     for item in data:
@@ -779,6 +856,7 @@ def read_org_lic_records(sfc_id, sfc_ri):
 def update_ind_lic_rec(staff_id, records):
     """Update the detailed licence history of an individual.
 
+    Ported from SFC.vb UpdLicRec (lines 987-1072).
     Returns (changed, records_with_org_ids).
     """
     changed = False
@@ -871,7 +949,10 @@ def update_ind_lic_rec(staff_id, records):
 # Updating org licence records in DB
 # ---------------------------------------------------------------------------
 def update_org_lic_rec(org_id, records, sfc_ri_new, sfc_ri_old):
-    """Update the SFC licence history of one org."""
+    """Update the SFC licence history of one org.
+
+    Ported from SFC.vb SFCorgHist (lines 845-896).
+    """
     # Update sfc_ri if changed
     if sfc_ri_new != sfc_ri_old:
         db_execute(
@@ -910,6 +991,8 @@ def update_org_lic_rec(org_id, records, sfc_ri_new, sfc_ri_old):
                 db_execute("UPDATE olicrec SET end_date=? WHERE id=?", (ended, rec_id))
             elif ex_end is not None and ended is None:
                 db_execute("UPDATE olicrec SET end_date=NULL WHERE id=?", (rec_id,))
+            elif ex_end is not None and ended is not None and ended != ex_end:
+                db_execute("UPDATE olicrec SET end_date=? WHERE id=?", (ended, rec_id))
 
     db_commit()
 
@@ -952,6 +1035,7 @@ def subtract_ro_from_rep(ro_periods, rep_periods):
 
     Both inputs should be sorted, non-overlapping.
     Returns remaining Rep fragments.
+    Ported from SFC.vb lines 708-790.
     """
     if not rep_periods:
         return []
@@ -1030,6 +1114,7 @@ def _date_le(a, b):
 def compute_directorships(person_id, lic_records):
     """Compute directorship periods from licence records.
 
+    Ported from SFC.vb SFCindHist lines 617-828.
     Steps:
     1. Group by (org_id, role) and merge overlapping periods
     2. For each org, subtract RO from Rep (RO trumps Rep)
@@ -1104,69 +1189,84 @@ def compute_directorships(person_id, lic_records):
 def sfc_ind_hist(sfc_id, recomp=False):
     """Get the history of an individual and update the DB.
 
+    Ported from SFC.vb SFCindHist (lines 582-828).
     If recomp=True, update directorships even if no change to licrec.
+    Returns True when the history was fetched and processed.
     """
     row = db_fetchone("SELECT person_id, name1, name2 FROM people WHERE sfc_id=?", (sfc_id,))
     if not row:
-        return
+        return False
     person_id = row["person_id"]
 
     records, found = read_ind_lic_records(sfc_id)
     if not found:
-        return
+        return False
+    if not records:
+        # Some historical CE refs still have a public page but expose an empty
+        # licRecordData array. Mark checked and preserve existing history.
+        db_execute("UPDATE people SET sfc_upd=? WHERE person_id=?", (now_iso(), person_id))
+        db_commit()
+        return True
 
     changed, records = update_ind_lic_rec(person_id, records)
     if not changed and not recomp:
-        return
+        return True
 
     compute_directorships(person_id, records)
+    return True
 
 # ---------------------------------------------------------------------------
 # Org history: fetch and update records
 # ---------------------------------------------------------------------------
 def sfc_org_hist(org_person_id):
-    """Update the SFC licence history of one org."""
+    """Update the SFC licence history of one org.
+
+    Returns True when the history was fetched and processed.
+    """
     row = db_fetchone(
         "SELECT sfc_id, sfc_ri, name1 FROM organisations "
         "WHERE sfc_id IS NOT NULL AND person_id=?",
         (org_person_id,),
     )
     if not row:
-        return
+        return False
     sfc_id = row["sfc_id"]
     sfc_ri = bool(row["sfc_ri"])
 
     records, found, sfc_ri_new = read_org_lic_records(sfc_id, sfc_ri)
     if not found:
-        return
+        return False
 
     update_org_lic_rec(org_person_id, records, sfc_ri_new, sfc_ri)
+    return True
 
 # ---------------------------------------------------------------------------
 # Staff fetching: ROs and Reps for an org
 # ---------------------------------------------------------------------------
 def sfc_both_ranks(sfc_id, hours):
     """Fetch both ROs and Reps for an org, then update individual histories."""
-    _sfc_people_rank(sfc_id, 1, hours)
-    _sfc_people_rank(sfc_id, 0, hours)
+    ro_ok = _sfc_people_rank(sfc_id, 1, hours)
+    rep_ok = _sfc_people_rank(sfc_id, 0, hours)
+    return ro_ok and rep_ok
 
 def _sfc_people_rank(sfc_id, sfc_rank, hours):
     """Get names of licensed staff of an org and put them in the DB.
 
     sfc_rank: 1=RO, 0=Rep
+    Ported from SFC.vb SFCpeople (lines 401-495).
     """
     row = db_fetchone("SELECT person_id FROM organisations WHERE sfc_id=?", (sfc_id,))
     if not row:
-        return
+        return False
 
     page = "ro" if sfc_rank == 1 else "rep"
     html = get_sfc_page(page, sfc_id, "corp")
     if not html:
-        return
+        return False
 
     people = read_sfc_people(html, page)
     if not people:
-        return
+        return True
 
     for person in people:
         p_sfc_id = person["sfc_id"]
@@ -1196,12 +1296,69 @@ def _sfc_people_rank(sfc_id, sfc_rank, hours):
             try:
                 sfc_ind_hist(p_sfc_id, recomp=False)
             except Exception as e:
-                log(f"  ERROR updating history for {p_sfc_id}: {e}")
+                _record_update_error()
+                log(f"  ERROR updating history for {p_sfc_id}: {_format_exception(e)}", level="ERROR")
+                if LOG_TRACEBACKS:
+                    log(traceback.format_exc().rstrip(), level="DEBUG")
+    return True
 
 # ---------------------------------------------------------------------------
 # Parallel processing helper
 # ---------------------------------------------------------------------------
 _progress_lock = threading.Lock()
+_update_error_count = 0
+
+def _reset_update_errors():
+    global _update_error_count
+    with _progress_lock:
+        _update_error_count = 0
+
+def _record_update_error(count=1):
+    global _update_error_count
+    with _progress_lock:
+        _update_error_count += count
+
+def _get_update_errors():
+    with _progress_lock:
+        return _update_error_count
+
+def _item_label(item):
+    """Return a compact identity label for worker error logs."""
+    values = {}
+    if isinstance(item, sqlite3.Row):
+        values = {key: item[key] for key in item.keys()}
+    elif isinstance(item, dict):
+        values = item
+    if not values:
+        return f" item={item!r}"
+
+    parts = []
+    for key in ("sfc_id", "person_id", "name1", "name2"):
+        value = values.get(key)
+        if value not in (None, ""):
+            parts.append(f"{key}={value}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+def _format_exception(exc):
+    return f"{type(exc).__name__}: {exc}"
+
+def _run_step(name, fn, *args, **kwargs):
+    """Run a major update step and log elapsed time and new error count."""
+    start = time.monotonic()
+    errors_before = _get_update_errors()
+    log(f"--- {name} started ---")
+    try:
+        result = fn(*args, **kwargs)
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        log(f"--- {name} failed after {elapsed:.1f}s: {_format_exception(e)} ---", level="ERROR")
+        if LOG_TRACEBACKS:
+            log(traceback.format_exc().rstrip(), level="DEBUG")
+        raise
+    elapsed = time.monotonic() - start
+    new_errors = _get_update_errors() - errors_before
+    log(f"--- {name} finished in {elapsed:.1f}s (new_errors={new_errors}) ---")
+    return result
 
 def _run_parallel(items, worker_fn, desc="items"):
     """Process items in parallel using the thread pool.
@@ -1221,7 +1378,13 @@ def _run_parallel(items, worker_fn, desc="items"):
         except Exception as e:
             with _progress_lock:
                 errors[0] += 1
-            log(f"  ERROR processing {desc}: {e}")
+            _record_update_error()
+            log(
+                f"  ERROR processing {desc}{_item_label(item)}: {_format_exception(e)}",
+                level="ERROR",
+            )
+            if LOG_TRACEBACKS:
+                log(traceback.format_exc().rstrip(), level="DEBUG")
             db_commit()  # ensure partial work is saved
             return
         with _progress_lock:
@@ -1243,6 +1406,7 @@ def _run_parallel(items, worker_fn, desc="items"):
 def step1_discover_corps():
     """Search for all SFC-licensed corporations (active + ceased).
 
+    Ported from SFC.vb NewSFCcorps (lines 97-149).
     Uses licstatus=all to capture full historical dataset.
     """
     log("=== Step 1: Discovering all SFC-licensed corporations ===")
@@ -1276,11 +1440,13 @@ def step1_discover_corps():
                     new_count += 1
 
                     # Get licence history
-                    sfc_org_hist(org_id)
+                    if not sfc_org_hist(org_id):
+                        raise RuntimeError(f"licence history not found for org {sfc_id}")
 
                     if is_corp:
                         # Get people (ROs and Reps)
-                        sfc_both_ranks(sfc_id, 0)
+                        if not sfc_both_ranks(sfc_id, 0):
+                            raise RuntimeError(f"staff pages not fetched for org {sfc_id}")
 
                     db_execute(
                         "UPDATE organisations SET sfc_upd=? WHERE person_id=?",
@@ -1288,7 +1454,10 @@ def step1_discover_corps():
                     )
                     db_commit()
                 except Exception as e:
-                    log(f"    ERROR processing corp {sfc_id}: {e}")
+                    log(f"    ERROR processing corp {sfc_id}: {_format_exception(e)}", level="ERROR")
+                    if LOG_TRACEBACKS:
+                        log(traceback.format_exc().rstrip(), level="DEBUG")
+                    _record_update_error()
                     db_commit()
 
     log(f"  Step 1 complete: {new_count} new corporations")
@@ -1299,6 +1468,7 @@ def step1_discover_corps():
 def step2_update_org_staff(force=False):
     """Update current staff of all known non-RI orgs.
 
+    Ported from SFC.vb UpdSFCorgPpl (lines 337-357).
     Uses thread pool for parallel HTTP fetching.
     """
     log("=== Step 2: Updating current staff of known orgs ===")
@@ -1319,7 +1489,8 @@ def step2_update_org_staff(force=False):
     def process_org(row):
         sfc_id = row["sfc_id"]
         person_id = row["person_id"]
-        sfc_both_ranks(sfc_id, hours)
+        if not sfc_both_ranks(sfc_id, hours):
+            raise RuntimeError(f"staff pages not fetched for org {sfc_id}")
         db_execute(
             "UPDATE organisations SET sfc_upd=? WHERE person_id=?",
             (now_iso(), person_id),
@@ -1336,6 +1507,7 @@ def step2_update_org_staff(force=False):
 def step3_update_ppl_hist(force=False):
     """Update histories of ALL people with an SFC ID.
 
+    Ported from SFC.vb UpdSFCpplHist/UpdSFCallPpl.
     Uses thread pool for parallel HTTP fetching.
     """
     log("=== Step 3: Updating individual licence histories ===")
@@ -1352,7 +1524,8 @@ def step3_update_ppl_hist(force=False):
         to_update.append(row)
 
     def process_person(row):
-        sfc_ind_hist(row["sfc_id"], recomp=False)
+        if not sfc_ind_hist(row["sfc_id"], recomp=False):
+            raise RuntimeError(f"licence history not fetched for person {row['sfc_id']}")
 
     log(f"  {len(to_update)} people to update ({WORKER_THREADS} threads)...")
     done, errs = _run_parallel(to_update, process_person, desc="people hist")
@@ -1382,8 +1555,9 @@ def fetch_missing_people():
 
     def process_person(row):
         sfc_id = row["sfc_id"]
-        sfc_ind_hist(sfc_id, recomp=True)
-        # Mark as checked even if SFC returned no data, so we don't retry
+        if not sfc_ind_hist(sfc_id, recomp=True):
+            raise RuntimeError(f"licence history not fetched for person {sfc_id}")
+        # Mark as checked if processing succeeded but produced no timestamp.
         if not db_exists(
             "SELECT 1 FROM people WHERE sfc_id=? AND sfc_upd IS NOT NULL",
             (sfc_id,),
@@ -1414,7 +1588,8 @@ def step4_update_org_hist(live_only=False):
     rows = db_fetchall(sql)
 
     def process_org(row):
-        sfc_org_hist(row["person_id"])
+        if not sfc_org_hist(row["person_id"]):
+            raise RuntimeError(f"licence history not fetched for org {row['person_id']}")
 
     log(f"  {len(rows)} orgs to process ({WORKER_THREADS} threads)...")
     done, errs = _run_parallel(rows, process_org, desc="org hist")
@@ -1426,6 +1601,7 @@ def step4_update_org_hist(live_only=False):
 def step5_discover_individuals():
     """Search for all SFC-licensed individuals.
 
+    Ported from SFC.vb NewSFCppl (lines 150-200).
     Uses licstatus=all to capture full historical dataset.
     """
     log("=== Step 5: Discovering all SFC-licensed individuals ===")
@@ -1456,9 +1632,16 @@ def step5_discover_individuals():
                     log(f"    New: {sfc_id} {n1}, {n2}")
                     get_or_create_person(sfc_id, n1, n2, c_name)
                     new_count += 1
-                    sfc_ind_hist(sfc_id, recomp=True)
+                    if not sfc_ind_hist(sfc_id, recomp=True):
+                        raise RuntimeError(f"licence history not fetched for person {sfc_id}")
                 except Exception as e:
-                    log(f"    ERROR processing individual {sfc_id}: {e}")
+                    log(
+                        f"    ERROR processing individual {sfc_id}: {_format_exception(e)}",
+                        level="ERROR",
+                    )
+                    if LOG_TRACEBACKS:
+                        log(traceback.format_exc().rstrip(), level="DEBUG")
+                    _record_update_error()
                     db_commit()
 
     log(f"  Step 5 complete: {new_count} new individuals")
@@ -1469,6 +1652,7 @@ def step5_discover_individuals():
 def step6_update_addresses():
     """Update org addresses and websites.
 
+    Ported from SFC.vb UpdSFCaddresses (lines 201-336).
     Uses thread pool for parallel HTTP fetching.
     """
     log("=== Step 6: Updating org addresses ===")
@@ -1645,10 +1829,16 @@ def _update_address(html, sfc_id, ptype, pid):
 def step7_compute_totals(upd=True):
     """Compute monthly summary totals by activity type.
 
+    Ported from SFC.vb LicrecSum (lines 35-96).
     upd=True: only update latest month (incremental).
     upd=False: full recompute from scratch.
     """
     log("=== Step 7: Computing monthly summary totals ===")
+    db_execute(
+        "INSERT OR IGNORE INTO activity (id, name) VALUES (?, ?)",
+        (0, "All regulated activities"),
+    )
+    db_commit()
     row = db_fetchone("SELECT MAX(id) as max_id FROM activity")
     max_a = row["max_id"] if row and row["max_id"] else 13
 
@@ -1735,9 +1925,24 @@ def _get_licrecsum_start(act_type, upd):
 # ---------------------------------------------------------------------------
 # Main update flow
 # ---------------------------------------------------------------------------
+def _log_runtime_config(mode):
+    log(
+        "Runtime config: "
+        f"mode={mode}, workers={WORKER_THREADS}, max_age_hours={HOURS_THRESHOLD:g}, "
+        f"retries={MAX_RETRIES}, timeout={REQUEST_TIMEOUT[0]:g}/{REQUEST_TIMEOUT[1]:g}s, "
+        f"request_delay={REQUEST_DELAY:g}s, proxy={'enabled' if PROXIES else 'disabled'}, "
+        f"db={DB_PATH}"
+    )
+
 def sfc_update(full=False):
-    """Main update entry point."""
+    """Main update entry point.
+
+    Ported from SFC.vb SFCupdate().
+    """
+    _reset_update_errors()
+    success = True
     log(f"SFC update started at {now_iso()} (full={full})")
+    _log_runtime_config("full" if full else "incremental")
     db_execute(
         "INSERT INTO update_log (event, timestamp) VALUES (?,?)",
         ("SFCstart", now_iso()),
@@ -1746,44 +1951,52 @@ def sfc_update(full=False):
 
     try:
         # Step 1: Discover all corporations
-        step1_discover_corps()
+        _run_step("Step 1 discover corporations", step1_discover_corps)
 
         # Step 2: Update current staff of known orgs
-        step2_update_org_staff(force=full)
+        _run_step("Step 2 update org staff", step2_update_org_staff, force=full)
 
         # Step 3: Update individual licence histories (all people with SFC ID)
-        step3_update_ppl_hist(force=full)
+        _run_step("Step 3 update people histories", step3_update_ppl_hist, force=full)
 
         # Step 4: Update org licence histories
-        step4_update_org_hist(live_only=not full)
+        _run_step("Step 4 update org histories", step4_update_org_hist, live_only=not full)
 
         # Step 5: Discover all individuals
-        step5_discover_individuals()
+        _run_step("Step 5 discover individuals", step5_discover_individuals)
 
         # Step 6: Update addresses
-        step6_update_addresses()
+        _run_step("Step 6 update addresses", step6_update_addresses)
 
         # Step 7: Compute monthly totals (full recompute due to SFC late-edits)
-        step7_compute_totals(upd=False)
+        _run_step("Step 7 compute monthly totals", step7_compute_totals, upd=False)
 
     except KeyboardInterrupt:
-        log("Interrupted by user. Progress has been saved.")
+        success = False
+        log("Interrupted by user. Progress has been saved.", level="WARNING")
     except Exception as e:
-        log(f"SFC update FAILED: {e}")
-        import traceback
-        traceback.print_exc(file=sys.stderr)
+        success = False
+        log(f"SFC update FAILED: {_format_exception(e)}", level="ERROR")
+        log(traceback.format_exc().rstrip(), level="ERROR")
     finally:
+        error_count = _get_update_errors()
+        if error_count:
+            success = False
+            log(f"SFC update completed with {error_count} item-level error(s).", level="ERROR")
         db_execute(
             "INSERT INTO update_log (event, timestamp) VALUES (?,?)",
             ("SFCend", now_iso()),
         )
         db_commit()
         log(f"SFC update ended at {now_iso()}")
+    return success
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main():
+    global DB_PATH, HOURS_THRESHOLD, WORKER_THREADS
+
     parser = argparse.ArgumentParser(
         description="Update SFC licensee SQLite database from the SFC public register."
     )
@@ -1818,36 +2031,69 @@ def main():
         default=None,
         help=(
             "Path to the SQLite database file. "
-            "Defaults to ./sfc.db (override with $SFC_DB_PATH)."
+            "Defaults to ./sfc.db (override with SFC_DB_PATH)."
         ),
+    )
+    parser.add_argument(
+        "--max-age-hours",
+        type=float,
+        default=None,
+        help=(
+            "Skip entity refresh if sfc_upd is newer than this many hours "
+            f"(default: {HOURS_THRESHOLD:g})."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=f"Parallel HTTP worker threads (default: {WORKER_THREADS}).",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Append timestamped logs to this file; can also use SFC_LOG_PATH.",
     )
     args = parser.parse_args()
 
     if args.db:
-        global DB_PATH
         DB_PATH = os.path.abspath(args.db)
+    if args.max_age_hours is not None:
+        if args.max_age_hours < 0:
+            parser.error("--max-age-hours must be >= 0")
+        HOURS_THRESHOLD = args.max_age_hours
+    if args.workers is not None:
+        if args.workers < 1:
+            parser.error("--workers must be >= 1")
+        WORKER_THREADS = args.workers
 
-    if args.step5 or args.step6 or args.step7:
-        get_db()  # ensure DB is initialized
-        if args.step5:
-            log(f"SFC Step 5 (discover individuals) started at {now_iso()}")
-            step5_discover_individuals()
-            log(f"SFC Step 5 ended at {now_iso()}")
-        if args.step6:
-            log(f"SFC Step 6 (update addresses) started at {now_iso()}")
-            step6_update_addresses()
-            log(f"SFC Step 6 ended at {now_iso()}")
-        if args.step7:
-            log(f"SFC Step 7 (compute totals) started at {now_iso()}")
-            step7_compute_totals(upd=False)
-            log(f"SFC Step 7 ended at {now_iso()}")
-    elif args.missing:
-        log(f"SFC missing-history fetch started at {now_iso()}")
-        get_db()  # ensure DB is initialized
-        fetch_missing_people()
-        log(f"SFC missing-history fetch ended at {now_iso()}")
-    else:
-        sfc_update(full=args.full)
+    configure_logging(args.log_file or LOG_PATH)
+    try:
+        _reset_update_errors()
+        if args.step5 or args.step6 or args.step7:
+            get_db()  # ensure DB is initialized
+            _log_runtime_config("targeted")
+            if args.step5:
+                _run_step("Step 5 discover individuals", step5_discover_individuals)
+            if args.step6:
+                _run_step("Step 6 update addresses", step6_update_addresses)
+            if args.step7:
+                _run_step("Step 7 compute monthly totals", step7_compute_totals, upd=False)
+            if _get_update_errors():
+                sys.exit(1)
+        elif args.missing:
+            log(f"SFC missing-history fetch started at {now_iso()}")
+            get_db()  # ensure DB is initialized
+            _log_runtime_config("missing")
+            _run_step("Fetch missing people histories", fetch_missing_people)
+            log(f"SFC missing-history fetch ended at {now_iso()}")
+            if _get_update_errors():
+                sys.exit(1)
+        else:
+            if not sfc_update(full=args.full):
+                sys.exit(1)
+    finally:
+        close_logging()
 
 if __name__ == "__main__":
     main()
