@@ -234,6 +234,22 @@ Inspired by, and modelled after, the long-running SFC scraper that powers
 project is an independent client of the public SFC API and is not affiliated
 with, endorsed by, or derived from Webb-site.
 
+## Related work
+
+As per suggestion, related work using the same public SFC register data
+includes the [HK SFC Register Kaggle dataset](https://www.kaggle.com/datasets/gautiermarti/hk-sfc-register)
+and two papers:
+
+- AlKetbi, A., Marti, G., AlNuaimi, K., Jaradat, R., & Henschel, A. (2025).
+  "Mapping Hong Kong's Financial Ecosystem: A Network Analysis of the SFC's
+  Licensed Professionals and Institutions." In *Complex Networks & Their
+  Applications XIII*, Springer, pp. 251-263.
+  <https://doi.org/10.1007/978-3-031-82431-9_21>
+- AlKetbi, A., Yam, P., Marti, G., & Jaradat, R. (2025). "Network Contagion
+  in Financial Labor Markets: Predicting Turnover in Hong Kong." Accepted at
+  Complex Networks 2025; arXiv:2509.08001.
+  <https://arxiv.org/abs/2509.08001>
+
 ## License
 
 [MIT](LICENSE) © 2026 Chenning Xu
